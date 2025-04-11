@@ -1,7 +1,7 @@
 use ndarray::Array2;
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CEvent {
     pub timestamp: u64,
     pub timestamp_us: f64,
@@ -20,7 +20,7 @@ pub struct CEvent {
 /// The inner `c_event` field can be passed to the C function, while the owned
 /// buffers are automatically dropped when the wrapper goes out of scope.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EventWrapper {
     pub c_event: CEvent,
 

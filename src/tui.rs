@@ -76,7 +76,7 @@ impl Status {
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let (tx_stats, rx_stats) = unbounded();
-            let (tx_events, ev_handle, board_handles) =
+            let (tx_events, ev_handle, data_taking_handle) =
                 self.begin_run(Arc::clone(&shutdown), tx_stats)?;
 
             while self.exit.is_none() {
@@ -117,9 +117,9 @@ impl Status {
                 crate::felib_sendcommand(dev, "/cmd/disarmacquisition")?;
             }
             // join board threads
-            for h in board_handles {
-                h.join().expect("board thread panic");
-            }
+            data_taking_handle
+                .join()
+                .expect("data taking thread panic")?;
             // drop tx_events so event thread will exit
             drop(tx_events);
             // wait for event‐processing to finish
@@ -197,45 +197,40 @@ impl Status {
     ) -> Result<(
         Sender<BoardEvent>,
         JoinHandle<Result<()>>,
-        Vec<JoinHandle<()>>,
+        JoinHandle<Result<()>>,
     )> {
         // Shared signal for acquisition start.
         let acq_start = Arc::new((Mutex::new(false), Condvar::new()));
         // Shared counter for endpoint configuration.
-        let endpoint_configured = Arc::new((Mutex::new(0u32), Condvar::new()));
+        let endpoint_configured = Arc::new((Mutex::new(false), Condvar::new()));
 
         // Channel to receive events from board threads.
         let (tx_events, rx_events) = unbounded();
 
-        // Spawn a data-taking thread for each board.
-        let mut board_thread_handles = Vec::new();
-        for &(board_id, dev_handle) in &self.boards {
-            let config_clone = self.config.clone();
-            let acq_start_clone = Arc::clone(&acq_start);
-            let endpoint_configured_clone = Arc::clone(&endpoint_configured);
-            let tx_clone = tx_events.clone();
-            let shutdown_clone = Arc::clone(&shutdown);
-            let handle = thread::spawn(move || {
-                data_taking_thread(
-                    board_id,
-                    dev_handle,
-                    config_clone,
-                    tx_clone,
-                    acq_start_clone,
-                    endpoint_configured_clone,
-                    shutdown_clone,
-                )
-                .unwrap_or_else(|e| eprintln!("Board {} error: {:?}", board_id, e));
-            });
-            board_thread_handles.push(handle);
-        }
+        // Spawn a data-taking thread .
+        let boards_clone = self.boards.clone();
+        let config_clone = self.config.clone();
+        let acq_start_clone = Arc::clone(&acq_start);
+        let endpoint_configured_clone = Arc::clone(&endpoint_configured);
+        let tx_clone = tx_events.clone();
+        let shutdown_clone = Arc::clone(&shutdown);
+        let data_taking_handle = thread::spawn(move || {
+            data_taking_thread(
+                boards_clone,
+                config_clone,
+                tx_clone,
+                acq_start_clone,
+                endpoint_configured_clone,
+                shutdown_clone,
+            )
+        });
 
         // Wait until all boards have configured their endpoints.
         {
             let (lock, cond) = &*endpoint_configured;
-            let mut count = lock.lock().unwrap();
-            while *count < self.boards.len() as u32 {
-                count = cond.wait(count).unwrap();
+            let mut configured = lock.lock().unwrap();
+            while !*configured {
+                configured = cond.wait(configured).unwrap();
             }
         }
 
@@ -260,7 +255,7 @@ impl Status {
             event_processing(rx_events, tx_stats, run_file, config_clone, shutdown_clone)
         });
 
-        Ok((tx_events, event_processing_handle, board_thread_handles))
+        Ok((tx_events, event_processing_handle, data_taking_handle))
     }
 
     fn create_run_file(&mut self) -> Result<PathBuf> {
@@ -431,28 +426,30 @@ fn event_processing(
 /// It configures the endpoint, signals that configuration is complete,
 /// waits for the shared acquisition start signal, then continuously reads events and sends them.
 fn data_taking_thread(
-    board_id: usize,
-    dev_handle: u64,
+    boards: Vec<(usize, u64)>,
     config: Conf,
     tx: Sender<BoardEvent>,
     acq_start: Arc<(Mutex<bool>, Condvar)>,
-    endpoint_configured: Arc<(Mutex<u32>, Condvar)>,
+    endpoint_configured: Arc<(Mutex<bool>, Condvar)>,
     shutdown: Arc<AtomicBool>,
-) -> Result<(), FELibReturn> {
+) -> Result<()> {
     // Set up endpoint.
-    let mut ep_handle = 0;
-    let mut ep_folder_handle = 0;
-    crate::felib_gethandle(dev_handle, "/endpoint/scope", &mut ep_handle)?;
-    crate::felib_getparenthandle(ep_handle, "", &mut ep_folder_handle)?;
-    crate::felib_setvalue(ep_folder_handle, "/par/activeendpoint", "scope")?;
-    crate::felib_setreaddataformat(ep_handle, crate::EVENT_FORMAT)?;
-    crate::felib_sendcommand(dev_handle, "/cmd/armacquisition")?;
+    let mut ep_handles = vec![(0, 0); boards.len()];
+    for (&(_, dev_handle), (ep_handle, ep_folder_handle)) in
+        boards.iter().zip(ep_handles.iter_mut())
+    {
+        crate::felib_gethandle(dev_handle, "/endpoint/scope", ep_handle)?;
+        crate::felib_getparenthandle(*ep_handle, "", ep_folder_handle)?;
+        crate::felib_setvalue(*ep_folder_handle, "/par/activeendpoint", "scope")?;
+        crate::felib_setreaddataformat(*ep_handle, crate::EVENT_FORMAT)?;
+        crate::felib_sendcommand(dev_handle, "/cmd/armacquisition")?;
+    }
 
     // Signal that this board's endpoint is configured.
     {
         let (lock, cond) = &*endpoint_configured;
-        let mut count = lock.lock().unwrap();
-        *count += 1;
+        let mut configured = lock.lock().unwrap();
+        *configured = true;
         cond.notify_all();
     }
 
@@ -469,30 +466,43 @@ fn data_taking_thread(
     // num_ch has to be 64 due to the way CAEN reads data from the board
     let num_ch = 64;
     let waveform_len = config.board_settings.record_len;
-    let mut event = EventWrapper::new(num_ch, waveform_len);
+    let mut events = vec![EventWrapper::new(num_ch, waveform_len); boards.len()];
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let ret = crate::felib_readdata(ep_handle, &mut event);
-        match ret {
-            FELibReturn::Success => {
-                // Instead of allocating a new EventWrapper,
-                // swap out the current one using std::mem::replace.
-                let board_event = BoardEvent {
-                    board_id,
-                    event: std::mem::replace(&mut event, EventWrapper::new(num_ch, waveform_len)),
-                };
+        let mut board_events = Vec::new();
+        let mut successes = 0;
+        for &(board_id, dev_handle) in &boards {
+            let ret = crate::felib_readdata(dev_handle, &mut events[board_id]);
+            match ret {
+                FELibReturn::Success => {
+                    // Instead of allocating a new EventWrapper,
+                    // swap out the current one using std::mem::replace.
+                    let board_event = BoardEvent {
+                        board_id,
+                        event: std::mem::replace(
+                            &mut events[board_id],
+                            EventWrapper::new(num_ch, waveform_len),
+                        ),
+                    };
+                    board_events.push(board_event);
+                    successes += 1;
+                }
+                FELibReturn::Timeout => continue,
+                FELibReturn::Stop => {
+                    // println!("Board {}: Stop received...", board_id);
+                    break;
+                }
+                _ => (),
+            }
+        }
+        if successes == 2 {
+            for board_event in board_events {
                 if tx.send(board_event).is_err() {
                     break;
                 }
             }
-            FELibReturn::Timeout => continue,
-            FELibReturn::Stop => {
-                // println!("Board {}: Stop received...", board_id);
-                break;
-            }
-            _ => (),
         }
     }
     Ok(())
